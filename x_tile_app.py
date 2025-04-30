@@ -3,6 +3,7 @@
 ###########################
 import dash
 from dash import dcc, html, Input, Output, State, dash_table
+from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import base64
@@ -19,6 +20,10 @@ from lifelines.utils import median_survival_times
 import concurrent.futures
 import os
 from dash import DiskcacheManager, CeleryManager
+
+MAX_POOL_WORKERS = os.cpu_count() - 1 or 1  # Use all available cores, but at least 1
+
+PERCENTILE_LINSPACE = 40  # Number of percentiles to consider for cutpoints
 
 if "REDIS_URL" in os.environ:
     from celery import Celery
@@ -80,7 +85,7 @@ def compute_direction(data, low_cut, high_cut):
         return 0
     if high_median < low_median:
         return -1
-    elif high_median > low_median:
+    elif high_median >= low_median:
         return 1
     else:
         return 0
@@ -125,33 +130,101 @@ default_data_json = _debug_df.to_json(date_format="iso", orient="split")
 ##############################################
 # 3) CANDIDATE GRID FOR THE HEATMAP (Precomputed)
 ##############################################
-def build_candidate_grid(data):
+# def build_candidate_grid(data):
+#     """
+#     Build a grid of candidate cutpoints.
+#     Orientation:
+#       - X axis: low cutpoints (ascending)
+#       - Y axis: high cutpoints (top = highest, bottom = lowest)
+#     For each valid candidate (low <= high), compute the signed statistic = chi-square * direction.
+#     """
+#     df = data.copy()
+#     pct_vals = np.percentile(df["biomarker"], np.linspace(5, 95, PERCENTILE_LINSPACE))
+#     pct_vals = np.unique(np.round(pct_vals, 2))
+#     low_array = np.sort(pct_vals)  # For X axis (ascending)
+#     high_array_asc = np.sort(pct_vals)  # Then reverse for Y axis
+#     n_low = len(low_array)
+#     n_high = len(high_array_asc)
+#     M = np.full((n_high, n_low), np.nan)
+
+
+#     for i in range(n_high):
+#         high_cut = high_array_asc[i]
+#         for j in range(n_low):
+#             low_cut = low_array[j]
+#             if low_cut <= high_cut:
+#                 chi2 = compute_logrank_statistic(df, low_cut, high_cut)
+#                 if not np.isnan(chi2):
+#                     sign = compute_direction(df, low_cut, high_cut)
+#                     M[i, j] = chi2 * sign
+#     high_array = high_array_asc[::-1]  # Reverse: largest high cut at the top
+#     M = np.flipud(M)
+#     return low_array, high_array, M
+
+
+# this will live in each worker
+_worker_df = None
+
+
+def _init_worker(df):
+    """Initializer for each process: stash df in a module-level variable."""
+    global _worker_df
+    _worker_df = df
+
+
+def _compute_cell(args):
+    """Top-level worker function, so it can be pickled."""
+    i, j, low_cut, high_cut = args
+    # use the shared DataFrame in this process
+    df = _worker_df
+
+    chi2 = compute_logrank_statistic(df, low_cut, high_cut)
+    if np.isnan(chi2):
+        return (i, j, np.nan)
+    sign = compute_direction(df, low_cut, high_cut)
+    return (i, j, chi2 * sign)
+
+
+def build_candidate_grid(data, n_jobs=MAX_POOL_WORKERS):
     """
     Build a grid of candidate cutpoints.
-    Orientation:
-      - X axis: low cutpoints (ascending)
-      - Y axis: high cutpoints (top = highest, bottom = lowest)
-    For each valid candidate (low <= high), compute the signed statistic = chi-square * direction.
+    If n_jobs>1, dispatch across processes for real parallelism.
     """
+    # 1) copy & build your percentile arrays
     df = data.copy()
-    pct_vals = np.percentile(df["biomarker"], np.linspace(5, 95, 25))
+    pct_vals = np.percentile(df["biomarker"], np.linspace(5, 95, PERCENTILE_LINSPACE))
     pct_vals = np.unique(np.round(pct_vals, 2))
-    low_array = np.sort(pct_vals)  # For X axis (ascending)
-    high_array_asc = np.sort(pct_vals)  # Then reverse for Y axis
-    n_low = len(low_array)
-    n_high = len(high_array_asc)
-    M = np.full((n_high, n_low), np.nan)
+    low_array = np.sort(pct_vals)
+    high_array_asc = np.sort(pct_vals)
+    n_low, n_high = len(low_array), len(high_array_asc)
 
-    for i in range(n_high):
-        high_cut = high_array_asc[i]
-        for j in range(n_low):
-            low_cut = low_array[j]
+    # 2) prepare an empty matrix and a flat list of tasks
+    M = np.full((n_high, n_low), np.nan)
+    tasks = []
+    for i, high_cut in enumerate(high_array_asc):
+        for j, low_cut in enumerate(low_array):
             if low_cut <= high_cut:
-                chi2 = compute_logrank_statistic(df, low_cut, high_cut)
-                if not np.isnan(chi2):
-                    sign = compute_direction(df, low_cut, high_cut)
-                    M[i, j] = chi2 * sign
-    high_array = high_array_asc[::-1]  # Reverse: largest high cut at the top
+                tasks.append((i, j, low_cut, high_cut))
+
+    # 3a) serial fallback
+    if n_jobs == 1:
+        for i, j, low_cut, high_cut in tasks:
+            chi2 = compute_logrank_statistic(df, low_cut, high_cut)
+            if not np.isnan(chi2):
+                sign = compute_direction(df, low_cut, high_cut)
+                M[i, j] = chi2 * sign
+
+    # 3b) real parallel with processes
+    else:
+        # initialize each worker with a copy of df
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=n_jobs, initializer=_init_worker, initargs=(df,)
+        ) as exe:
+            for i, j, val in exe.map(_compute_cell, tasks):
+                M[i, j] = val
+
+    # 4) re-orient Y axis exactly as before
+    high_array = high_array_asc[::-1]
     M = np.flipud(M)
     return low_array, high_array, M
 
@@ -278,24 +351,30 @@ def single_cv_iteration(args):
     else:
         train, val = random_split(data, test_size=test_size)
 
-    best_score = -np.inf
+    # 3-category split: use precomputed grid
     best_cutpoints = None
     if category_type == "3-category":
-        low_vals, high_vals, _ = build_candidate_grid(train)
-        for low in low_vals:
-            for high in high_vals:
-                if low < high:
-                    score = compute_logrank_statistic(train, low, high)
-                    if score is not None and not np.isnan(score) and score > best_score:
-                        best_score = score
-                        best_cutpoints = (low, high)
+        low_vals, high_vals, matrix = build_candidate_grid(train, n_jobs=1)
+        # If no valid cells, skip
+        if np.all(np.isnan(matrix)):
+            return None
+        # Find the index of the maximum absolute score
+        abs_mat = np.abs(matrix)
+        idx = np.nanargmax(abs_mat)
+        i, j = np.unravel_index(idx, matrix.shape)
+        best_score = matrix[i, j]
+        best_cutpoints = (low_vals[j], high_vals[i])
+
+    # 2-category split: compute directly
     elif category_type == "2-category":
-        candidate_vals = np.sort(np.unique(np.percentile(train["biomarker"], np.linspace(5, 95, 25))))
+        best_score = -np.inf
+        candidate_vals = np.sort(np.unique(np.percentile(train["biomarker"], np.linspace(5, 95, PERCENTILE_LINSPACE))))
         for cv in candidate_vals:
             score = compute_logrank_statistic(train, cv, cv)
             if score is not None and not np.isnan(score) and score > best_score:
                 best_score = score
                 best_cutpoints = (cv, cv)
+
     if best_cutpoints is None:
         return None
 
@@ -414,12 +493,23 @@ app.layout = dbc.Container(
             id="column-mapping-div",
             style={"display": "none"},
         ),
-        dcc.Graph(id="heatmap-figure", config={"displaylogo": False}),
-        html.Div(id="chosen-cutpoints", style={"margin": "20px 0", "fontWeight": "bold"}),
-        dbc.Row(
+        html.Div(
             [
-                dbc.Col(dcc.Graph(id="km-figure", config={"displaylogo": False}), md=6),
-                dbc.Col(dcc.Graph(id="hist-figure", config={"displaylogo": False}), md=6),
+                # Spinner only around the heatmap
+                dcc.Loading(
+                    id="loading-heatmap",
+                    type="default",
+                    children=dcc.Graph(id="heatmap-figure", config={"displaylogo": False}),
+                ),
+                # These update when you click the heatmap, but are NOT wrapped —
+                # so no distracting spinner on click!
+                html.Div(id="chosen-cutpoints", style={"margin": "20px 0", "fontWeight": "bold"}),
+                dbc.Row(
+                    [
+                        dbc.Col(dcc.Graph(id="km-figure", config={"displaylogo": False}), md=6),
+                        dbc.Col(dcc.Graph(id="hist-figure", config={"displaylogo": False}), md=6),
+                    ]
+                ),
             ]
         ),
         html.Hr(),
@@ -476,20 +566,28 @@ app.layout = dbc.Container(
             align="center",
         ),
         html.Br(),
-        dbc.Row(
-            [
-                dbc.Col(html.Div(id="cv-output"), md=6),
-                dbc.Col(dcc.Graph(id="cv-histogram", config={"displaylogo": False}), md=6),
-            ]
+        dcc.Loading(
+            id="loading-cv",
+            type="default",
+            children=html.Div(
+                [
+                    dbc.Row(
+                        [
+                            dbc.Col(html.Div(id="cv-output"), md=6),
+                            dbc.Col(dcc.Graph(id="cv-histogram", config={"displaylogo": False}), md=6),
+                        ]
+                    ),
+                    html.Hr(),
+                    dbc.Row(
+                        [
+                            dbc.Col(html.Div(id="cv-stats-output"), md=6),
+                            dbc.Col(html.Div(id="total-stats-output"), md=6),
+                        ]
+                    ),
+                    dbc.Row([dbc.Col(dcc.Graph(id="km-total", config={"displaylogo": False}), md=6)]),
+                ]
+            ),
         ),
-        html.Hr(),
-        dbc.Row(
-            [
-                dbc.Col(html.Div(id="cv-stats-output"), md=6),
-                dbc.Col(html.Div(id="total-stats-output"), md=6),
-            ]
-        ),
-        dbc.Row([dbc.Col(dcc.Graph(id="km-total", config={"displaylogo": False}), md=6)]),
     ],
     fluid=True,
 )
@@ -508,23 +606,11 @@ app.layout = dbc.Container(
     Input("dataset-json", "data"),
 )
 def update_column_mapping_options(data_json):
-    data = pd.read_json(data_json, orient="split")
+    data = pd.read_json(io.StringIO(data_json), orient="split")
     options = [{"label": col, "value": col} for col in data.columns]
     # If there are more than 3 columns, show the mapping div.
     style = {"display": "block"} if len(data.columns) > 3 else {"display": "none"}
     return options, options, options, style
-
-
-# Callback to save the user’s selected column mapping.
-@app.callback(
-    Output("column-mapping", "data"),
-    Input("confirm-mapping", "n_clicks"),
-    [State("col-biomarker", "value"), State("col-time", "value"), State("col-event", "value")],
-    prevent_initial_call=True,
-)
-def save_column_mapping(n_clicks, biomarker_col, time_col, event_col):
-    mapping = {"biomarker": biomarker_col, "time": time_col, "event": event_col}
-    return mapping
 
 
 # A helper function that applies the column mapping (if it exists) to the dataframe.
@@ -562,23 +648,43 @@ def handle_upload(contents, filename):
 
 
 @app.callback(
-    [Output("candidate-grid-store", "data"), Output("heatmap-figure", "figure")],
-    [Input("dataset-json", "data"), Input("confirm-mapping", "n_clicks")],
-    State("column-mapping", "data"),
+    [
+        Output("column-mapping", "data"),
+        Output("candidate-grid-store", "data"),
+        Output("heatmap-figure", "figure"),
+    ],
+    Input("confirm-mapping", "n_clicks"),
+    [
+        State("col-biomarker", "value"),
+        State("col-time", "value"),
+        State("col-event", "value"),
+        State("dataset-json", "data"),
+    ],
+    # prevent_initial_call=True,
 )
-def update_heatmap_and_store(data_json, confirm_clicks, mapping):
-    data = pd.read_json(data_json, orient="split")
-    # Apply mapping if provided; if mapping is missing or invalid, the function returns data unchanged.
-    data = apply_column_mapping(data, mapping)
-    try:
-        low_vals, high_vals, matrix = build_candidate_grid(data)
-    except Exception as e:
-        # If an error still occurs, return an empty figure with an error message.
-        print("Error building candidate grid:", e)
-        return {}, go.Figure(data=[go.Scatter(text=["Error building heatmap. Check column mapping."], mode="text")])
+def on_confirm_mapping(n_clicks, biomarker_col, time_col, event_col, data_json):
+    df = pd.read_json(io.StringIO(data_json), orient="split")
+    # 1) require all three selections
+    if "biomarker" in df.columns and "time" in df.columns and "event" in df.columns:
+        # If the mapping is already applied, skip this step.
+        pass
+    elif not (biomarker_col and time_col and event_col):
+        raise PreventUpdate
+
+    # 2) build & save mapping
+    mapping = {"biomarker": biomarker_col, "time": time_col, "event": event_col}
+
+    # 3) rename mapping
+    # df = pd.read_json(io.StringIO(data_json), orient="split")
+    df = apply_column_mapping(df, mapping)
+
+    # 4) build grid + figure
+    low_vals, high_vals, matrix = build_candidate_grid(df)
     fig = make_heatmap_figure(low_vals, high_vals, matrix)
-    store_dict = {"low_vals": list(low_vals), "high_vals": list(high_vals), "matrix": matrix.tolist()}
-    return store_dict, fig
+    store = {"low_vals": list(low_vals), "high_vals": list(high_vals), "matrix": matrix.tolist()}
+
+    # 5) return mapping, store, fig
+    return mapping, store, fig
 
 
 @app.callback(
@@ -591,7 +697,7 @@ def update_plots_from_click(clickData, data_json, mapping):
     chosen_text = "Click the heatmap to pick cutpoints."
     km_fig = go.Figure()
     hist_fig = go.Figure()
-    data = pd.read_json(data_json, orient="split")
+    data = pd.read_json(io.StringIO(data_json), orient="split")
     data = apply_column_mapping(data, mapping)
     if clickData:
         low_cut = float(clickData["points"][0]["x"])
@@ -636,7 +742,7 @@ def run_cross_validation(n_clicks, iterations, cv_category, cv_split_method, tes
       - Median survival per group and hazard ratios (and p-values) for the TOTAL COHORT.
     Finally, it produces a KM survival curve for the total cohort.
     """
-    data = pd.read_json(data_json, orient="split")
+    data = pd.read_json(io.StringIO(data_json), orient="split")
     data = apply_column_mapping(data, mapping)
 
     # Run cross-validation and aggregate CV iteration results.

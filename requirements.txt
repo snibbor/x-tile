@@ -1,0 +1,25 @@
+# x-tile dependencies
+python>=3.8
+
+# Core libraries
+pandas
+numpy
+
+# Survival analysis
+lifelines
+
+# Web app
+dash
+dash-bootstrap-components
+plotly
+
+dash[cache]
+
+diskcache
+celery
+
+# Machine learning utilities
+scikit-learn
+
+# Optional for notebook
+seaborn
