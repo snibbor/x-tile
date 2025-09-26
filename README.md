@@ -92,10 +92,6 @@ If you use **x-tile** in your research, please cite this repository and the orig
 
 - Camp RL, Dolled-Filhart M, Rimm DL. X-Tile: a new bio-informatics tool for biomarker assessment and outcome-based cut-point optimization. *Clin Cancer Res.* 2004 Nov 1;10(21):7252–9. doi:10.1158/1078-0432.CCR-04-0713  ([X-tile: a new bio-informatics tool for biomarker assessment and ...](https://pubmed.ncbi.nlm.nih.gov/15534099/)).
 
-## License
-
-LICENSE SECTION PENDING. See [LICENSE](LICENSE) for details.
-
 ## Acknowledgments
 
 This implementation modernizes the X-Tile methodology first introduced by Camp et al. at Yale University  ([X-tile: a new bio-informatics tool for biomarker assessment and ...](https://pubmed.ncbi.nlm.nih.gov/15534099/)). Contributions and feedback to this repository are welcome via GitHub issues.
